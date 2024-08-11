@@ -80,9 +80,9 @@
 
 extern crate num_cpus;
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -279,13 +279,14 @@ impl Builder {
     ///     .build();
     /// ```
     pub fn build(self) -> ThreadPool {
-        let (tx, rx) = channel::<Thunk<'static>>();
-
         let num_threads = self.num_threads.unwrap_or_else(num_cpus::get);
 
         let shared_data = Arc::new(ThreadPoolSharedData {
             name: self.thread_name,
-            job_receiver: Mutex::new(rx),
+            job_fifo: (
+                Mutex::new(VecDeque::<Thunk<'static>>::new()),
+                Condvar::new(),
+            ),
             empty_condvar: Condvar::new(),
             empty_trigger: Mutex::new(()),
             join_generation: AtomicUsize::new(0),
@@ -302,7 +303,6 @@ impl Builder {
         }
 
         ThreadPool {
-            jobs: tx,
             shared_data: shared_data,
         }
     }
@@ -310,7 +310,7 @@ impl Builder {
 
 struct ThreadPoolSharedData {
     name: Option<String>,
-    job_receiver: Mutex<Receiver<Thunk<'static>>>,
+    job_fifo: (Mutex<VecDeque<Thunk<'static>>>, Condvar),
     empty_trigger: Mutex<()>,
     empty_condvar: Condvar,
     join_generation: AtomicUsize,
@@ -344,7 +344,6 @@ pub struct ThreadPool {
     //
     // This is the only such Sender, so when it is dropped all subthreads will
     // quit.
-    jobs: Sender<Thunk<'static>>,
     shared_data: Arc<ThreadPoolSharedData>,
 }
 
@@ -429,9 +428,14 @@ impl ThreadPool {
         F: FnOnce() + Send + 'static,
     {
         self.shared_data.queued_count.fetch_add(1, Ordering::SeqCst);
-        self.jobs
-            .send(Box::new(job))
+        let mut fifo = self
+            .shared_data
+            .job_fifo
+            .0
+            .lock()
             .expect("ThreadPool::execute unable to send job into queue.");
+        fifo.push_back(Box::new(job));
+        self.shared_data.job_fifo.1.notify_one();
     }
 
     /// Returns the number of jobs waiting to executed in the pool.
@@ -676,7 +680,6 @@ impl Clone for ThreadPool {
     /// ```
     fn clone(&self) -> ThreadPool {
         ThreadPool {
-            jobs: self.jobs.clone(),
             shared_data: self.shared_data.clone(),
         }
     }
@@ -748,21 +751,20 @@ fn spawn_in_pool(shared_data: Arc<ThreadPoolSharedData>) {
                 if thread_counter_val >= max_thread_count_val {
                     break;
                 }
-                let message = {
+                let job = {
                     // Only lock jobs for the time it takes
                     // to get a job, not run it.
-                    let lock = shared_data
-                        .job_receiver
+                    let mut fifo = shared_data
+                        .job_fifo
+                        .0
                         .lock()
-                        .expect("Worker thread unable to lock job_receiver");
-                    lock.recv()
+                        .expect("Worker thread unable to lock job_fifo");
+                    while fifo.is_empty() {
+                        fifo = shared_data.job_fifo.1.wait(fifo).unwrap();
+                    }
+                    fifo.pop_front().unwrap()
                 };
 
-                let job = match message {
-                    Ok(job) => job,
-                    // The ThreadPool was dropped.
-                    Err(..) => break,
-                };
                 // Do not allow IR around the job execution
                 shared_data.active_count.fetch_add(1, Ordering::SeqCst);
                 shared_data.queued_count.fetch_sub(1, Ordering::SeqCst);
